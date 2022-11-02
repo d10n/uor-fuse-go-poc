@@ -6,6 +6,8 @@ import (
 	"text/template"
 
 	"github.com/spf13/cobra"
+
+	"github.com/uor-framework/uor-fuse-go/config"
 )
 
 var (
@@ -38,7 +40,7 @@ type clientVersion struct {
 }
 
 // NewVersionCmd creates a new cobra.Command for the version subcommand.
-func NewVersionCmd(rootOpts *RootOptions) *cobra.Command {
+func NewVersionCmd(rootOpts *config.RootOptions) *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
 		Short: "Print the version",
@@ -50,13 +52,11 @@ func NewVersionCmd(rootOpts *RootOptions) *cobra.Command {
 }
 
 // getVersion will output the templated version message.
-func getVersion(ro *RootOptions) error {
-
+func getVersion(ro *config.RootOptions) error {
 	versionWithBuild := func() string {
 		if buildData != "" {
 			return fmt.Sprintf("%s+%s", version, buildData)
 		}
-
 		return version
 	}
 

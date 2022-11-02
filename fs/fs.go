@@ -1,9 +1,8 @@
-package cli
+package fs
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -18,9 +17,10 @@ import (
 	"github.com/uor-framework/uor-client-go/nodes/descriptor"
 	"github.com/uor-framework/uor-client-go/ocimanifest"
 	"github.com/uor-framework/uor-client-go/registryclient"
-	"github.com/uor-framework/uor-fuse-go/cli/log"
 	"github.com/winfsp/cgofuse/fuse"
-	"oras.land/oras-go/v2/content"
+
+	"github.com/uor-framework/uor-fuse-go/cli/log"
+	"github.com/uor-framework/uor-fuse-go/config"
 )
 
 type DecayCache struct {
@@ -67,9 +67,21 @@ func (c *DecayCache) RemoveUser() {
 	}
 }
 
+type UorFsOptions struct {
+	*config.RootOptions
+	Source         string
+	MountPoint     string
+	Insecure       bool
+	PlainHTTP      bool
+	Configs        []string
+	AttributeQuery string
+	NoVerify       bool
+}
+
 type UorFs struct {
 	fuse.FileSystemBase
-	*MountOptions
+
+	*UorFsOptions
 	client  registryclient.Remote
 	matcher matchers.PartialAttributeMatcher
 
@@ -78,23 +90,23 @@ type UorFs struct {
 
 	mutex sync.Mutex
 	ino   uint64
-	root  *node_t
+	root  *UorFsNode
 	ctx   context.Context
 
 	cacheDuration *time.Duration
 }
 
-type node_t struct {
+type UorFsNode struct {
 	stat     fuse.Stat_t
 	xattrs   map[string][]byte
-	children map[string]*node_t
+	children map[string]*UorFsNode
 	data     *DecayCache
 	desc     *ocispec.Descriptor
 }
 
-func newNode(dev uint64, ino uint64, mode uint32, uid uint32, gid uint32) *node_t {
-	tmsp := fuse.Now()
-	node := node_t{
+func newNode(dev uint64, ino uint64, mode uint32, uid uint32, gid uint32) *UorFsNode {
+	now := fuse.Now()
+	node := UorFsNode{
 		fuse.Stat_t{
 			Dev:      dev,
 			Ino:      ino,
@@ -102,10 +114,10 @@ func newNode(dev uint64, ino uint64, mode uint32, uid uint32, gid uint32) *node_
 			Nlink:    1,
 			Uid:      uid,
 			Gid:      gid,
-			Atim:     tmsp,
-			Mtim:     tmsp,
-			Ctim:     tmsp,
-			Birthtim: tmsp,
+			Atim:     now,
+			Mtim:     now,
+			Ctim:     now,
+			Birthtim: now,
 			Flags:    0,
 		},
 		nil,
@@ -114,13 +126,13 @@ func newNode(dev uint64, ino uint64, mode uint32, uid uint32, gid uint32) *node_
 		nil,
 	}
 	if fuse.S_IFDIR == node.stat.Mode&fuse.S_IFMT {
-		node.children = map[string]*node_t{}
+		node.children = map[string]*UorFsNode{}
 		node.stat.Nlink = 2 // 1 from parent + 1 from self
 	}
 	return &node
 }
 
-func (fs *UorFs) lookupNode(path string) *node_t {
+func (fs *UorFs) lookupNode(path string) *UorFsNode {
 	pathParts := strings.Split(path, "/")
 	parent := fs.root
 	node := parent
@@ -155,7 +167,7 @@ func (fs *UorFs) Open(path string, flags int) (errc int, fh uint64) {
 
 func (fs *UorFs) Getattr(path string, stat *fuse.Stat_t, fh uint64) (errc int) {
 	defer fs.synchronize()()
-	fs.Logger.Infof("Getattr path: %v", path)
+	fs.Logger.Debugf("Getattr path: %v", path)
 
 	node := fs.lookupNode(path)
 	if node == nil {
@@ -212,10 +224,7 @@ func (fs *UorFs) Read(path string, buff []byte, ofst int64, fh uint64) (n int) {
 	return
 }
 
-func (fs *UorFs) Readdir(path string,
-	fill func(name string, stat *fuse.Stat_t, ofst int64) bool,
-	ofst int64,
-	fh uint64) (errc int) {
+func (fs *UorFs) Readdir(path string, fill func(name string, stat *fuse.Stat_t, ofst int64) bool, ofst int64, fh uint64) (errc int) {
 	defer fs.synchronize()()
 	fill(".", nil, 0)
 	fill("..", nil, 0)
@@ -250,7 +259,6 @@ func (fs *UorFs) Listxattr(path string, fill func(name string) bool) (errc int) 
 
 func (fs *UorFs) Getxattr(path string, name string) (errc int, xattr []byte) {
 	defer fs.synchronize()()
-	//node := fs.flats[path]
 	node := fs.lookupNode(path)
 	if node == nil {
 		return -fuse.ENOENT, nil
@@ -309,8 +317,7 @@ func (fs *UorFs) loadFromReference(ctx context.Context, reference string, client
 		}
 
 		//uid, gid, _ := fuse.Getcontext()
-		var node *node_t = newNode(0, 0, fuse.S_IFREG|00444, fs.euid, fs.egid) // 444
-
+		node := newNode(0, 0, fuse.S_IFREG|00444, fs.euid, fs.egid) // 444
 		node.desc = &layerInfo
 		node.stat.Size = layerInfo.Size
 		node.xattrs = map[string][]byte{}
@@ -335,18 +342,17 @@ func (fs *UorFs) loadFromReference(ctx context.Context, reference string, client
 }
 
 func getManifest(ctx context.Context, reference string, client registryclient.Remote, matcher matchers.PartialAttributeMatcher) ([]ocispec.Descriptor, error) {
-	manifestDesc, manifestRc, err := client.GetManifest(ctx, reference)
-	if err != nil {
-		return nil, err
-	}
-	manifestBytes, err := content.ReadAll(manifestRc, manifestDesc)
-	if err != nil {
-		return nil, err
-	}
+	//manifestDesc, manifestRc, err := client.GetManifest(ctx, reference)
+	//if err != nil {
+	//	return nil, err
+	//}
+	//manifestBytes, err := content.ReadAll(manifestRc, manifestDesc)
+	//if err != nil {
+	//	return nil, err
+	//}
 	//manifest, err := manifest.FromBlob(manifestBytes, manifestDesc.MediaType)
-	manifest, err := successorBytesToManifest(ctx, manifestBytes, manifestDesc)
-	fmt.Printf("%v\n", manifest)
-	//return manifest, nil
+	//manifest, err := bytesToManifest(ctx, manifestBytes, manifestDesc)
+	//fmt.Printf("%v\n", manifest)
 
 	graph, err := client.LoadCollection(ctx, reference)
 	if err != nil {
@@ -357,7 +363,7 @@ func getManifest(ctx context.Context, reference string, client registryclient.Re
 	if matcher != nil {
 		var matchedLeaf int
 		matchFn := model.MatcherFunc(func(node model.Node) (bool, error) {
-			// This check ensure we are not weeding out any manifests needed
+			// Ensure we are not weeding out any manifests needed
 			// for OCI DAG traversal.
 			if len(graph.From(node.ID())) != 0 {
 				return true, nil
@@ -415,9 +421,9 @@ func getManifest(ctx context.Context, reference string, client registryclient.Re
 	return result, nil
 }
 
-// getSuccessor returns the nodes directly pointed by the current node. This is adapted from the `oras` content.Successors
-// to allow the use of a function signature to pull descriptor content.
-func successorBytesToManifest(ctx context.Context, content []byte, node ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+// bytesToManifest returns the descriptors directly pointed by the provided descriptor's bytes.
+// This is adapted from `uor-client-go` loader.getSuccessors and `oras` content.Successors
+func bytesToManifest(ctx context.Context, content []byte, node ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 	switch node.MediaType {
 	case string(types.DockerManifestSchema2), ocispec.MediaTypeImageManifest:
 		// docker manifest and oci manifest are equivalent for successors.
@@ -472,12 +478,12 @@ func (fs *UorFs) buildFsNodes(ctx context.Context) {
 	}
 }
 
-func (fs *UorFs) insertNode(path string, node *node_t) {
+func (fs *UorFs) insertNode(path string, node *UorFsNode) {
 	pathParts := strings.Split(path, "/")
 	parent := fs.root
 	for i, part := range pathParts {
 		if parent.children == nil {
-			parent.children = map[string]*node_t{}
+			parent.children = map[string]*UorFsNode{}
 		}
 		if i == len(pathParts)-1 {
 			parent.children[part] = node
@@ -491,10 +497,10 @@ func (fs *UorFs) insertNode(path string, node *node_t) {
 	}
 }
 
-func NewUorFs(ctx context.Context, o MountOptions, client registryclient.Client, matcher matchers.PartialAttributeMatcher) *UorFs {
+func NewUorFs(ctx context.Context, o UorFsOptions, client registryclient.Client, matcher matchers.PartialAttributeMatcher) *UorFs {
 	duration := 5 * time.Minute
 	fs := UorFs{
-		MountOptions:  &o,
+		UorFsOptions:  &o,
 		client:        client,
 		matcher:       matcher,
 		ctx:           ctx,
@@ -505,7 +511,6 @@ func NewUorFs(ctx context.Context, o MountOptions, client registryclient.Client,
 	//uid, gid, _ := fuse.Getcontext()
 	fs.euid, fs.egid = uint32(os.Geteuid()), uint32(os.Getegid())
 	fs.root = newNode(0, 1, fuse.S_IFDIR|00555, fs.euid, fs.egid)
-	//fs.flats = map[string]*node_t{}
 
 	fs.buildFsNodes(ctx)
 	return &fs

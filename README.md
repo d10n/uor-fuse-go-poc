@@ -7,6 +7,8 @@ Usage:
     ./uor-fuse-go mount <collection> <mountpoint>
     ./uor-fuse-go mount localhost:5001/test:latest ./mount-dir/
 
+    # Read UOR attributes of files:
+    getfattr -d ./mount-dir/index.json
 
 Considerations / TODO:
 
@@ -19,3 +21,4 @@ Considerations / TODO:
   * Probably requires custom client
 * Periodic collection refresh
 * Add tests
+* Remove dead code
