@@ -4,8 +4,8 @@ Mount a UOR collection to a directory with FUSE.
 
 Usage:
 
-./uor-fuse-go mount <collection> <mountpoint>
-./uor-fuse-go mount localhost:5001/test:latest ./mount-dir/
+    ./uor-fuse-go mount <collection> <mountpoint>
+    ./uor-fuse-go mount localhost:5001/test:latest ./mount-dir/
 
 
 Considerations / TODO:
@@ -18,3 +18,4 @@ Considerations / TODO:
     * If the full file is cached, there is no need to fetch with a range
   * Probably requires custom client
 * Periodic collection refresh
+* Add tests
